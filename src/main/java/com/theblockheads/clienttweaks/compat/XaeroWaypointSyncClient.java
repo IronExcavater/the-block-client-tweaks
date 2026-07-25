@@ -20,6 +20,7 @@ import xaero.hud.minimap.world.MinimapWorld;
 import xaero.hud.minimap.world.container.MinimapWorldContainer;
 import xaero.hud.path.XaeroPath;
 
+import java.nio.charset.StandardCharsets;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Locale;
@@ -43,6 +44,7 @@ public final class XaeroWaypointSyncClient {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (++ticks >= POLL_INTERVAL_TICKS) {
                 ticks = 0;
+                importLocalWaypoints();
                 pollTrackedWaypoints();
             }
         });
@@ -74,9 +76,8 @@ public final class XaeroWaypointSyncClient {
         }
 
         Waypoint waypoint;
-        WaypointSet targetSet;
+        WaypointSet targetSet = set(world, cleanSetName(payload.setName()));
         if (located == null) {
-            targetSet = set(world, cleanSetName(payload.setName()));
             waypoint = new Waypoint(
                 payload.x(),
                 payload.y(),
@@ -90,13 +91,55 @@ public final class XaeroWaypointSyncClient {
             );
             targetSet.add(waypoint);
         } else {
-            targetSet = located.set();
             waypoint = located.waypoint();
+            if (!located.set().getName().equals(targetSet.getName())) {
+                located.set().remove(waypoint);
+                targetSet.add(waypoint);
+            }
             applySnapshot(waypoint, Snapshot.fromPayload(payload));
         }
 
         TRACKED.put(payload.id(), new TrackedWaypoint(payload.id(), payload.dimension(), targetSet.getName(), waypoint, Snapshot.fromPayload(payload)));
         markChangedAndSave(session, world, payload.name());
+    }
+
+    private static void importLocalWaypoints() {
+        if (!ClientPlayNetworking.canSend(WaypointClientEditPayload.TYPE)) {
+            return;
+        }
+
+        MinimapSession session = BuiltInHudModules.MINIMAP.getCurrentSession();
+        if (session == null || session.getWorldState().getAutoRootContainerPath() == null) {
+            return;
+        }
+
+        MinimapWorld world = session.getWorldManager().getCurrentWorld();
+        if (world == null) {
+            world = session.getWorldManager().getAutoWorld();
+        }
+        if (world == null || world.getDimId() == null) {
+            return;
+        }
+
+        String dimension = world.getDimId().identifier().toString();
+        for (WaypointSet set : world.getIterableWaypointSets()) {
+            for (Waypoint waypoint : set.getWaypoints()) {
+                if (isTracked(waypoint) || shouldSkipImport(waypoint)) {
+                    continue;
+                }
+
+                String setName = cleanSetName(set.getName());
+                UUID id = importedId(dimension, setName, waypoint);
+                Snapshot snapshot = Snapshot.fromWaypoint(dimension, setName, waypoint);
+                TrackedWaypoint tracked = TRACKED.get(id);
+                if (tracked != null && snapshot.equals(tracked.snapshot())) {
+                    continue;
+                }
+
+                TRACKED.put(id, new TrackedWaypoint(id, dimension, setName, waypoint, snapshot));
+                ClientPlayNetworking.send(payload(id, snapshot, false));
+            }
+        }
     }
 
     private static void pollTrackedWaypoints() {
@@ -122,20 +165,10 @@ public final class XaeroWaypointSyncClient {
                 continue;
             }
 
-            Snapshot current = Snapshot.fromWaypoint(tracked.snapshot().dimension(), located.waypoint());
+            Snapshot current = Snapshot.fromWaypoint(tracked.snapshot().dimension(), located.set().getName(), located.waypoint());
             if (!current.equals(tracked.snapshot())) {
                 TRACKED.put(tracked.id(), tracked.with(located.set().getName(), located.waypoint(), current));
-                ClientPlayNetworking.send(new WaypointClientEditPayload(
-                    false,
-                    tracked.id(),
-                    current.name(),
-                    current.initials(),
-                    current.dimension(),
-                    current.x(),
-                    current.y(),
-                    current.z(),
-                    current.color()
-                ));
+                ClientPlayNetworking.send(payload(tracked.id(), current, false));
             }
         }
     }
@@ -202,6 +235,10 @@ public final class XaeroWaypointSyncClient {
         waypoint.setInitials(safeWaypointText(snapshot.initials(), 3, "WP"));
         waypoint.setWaypointColor(color(snapshot.color()));
         waypoint.setColor(Math.floorMod(snapshot.color(), WaypointColor.values().length));
+        waypoint.setDisabled(snapshot.disabled());
+        waypoint.setYIncluded(snapshot.yIncluded());
+        waypoint.setVisibilityType(Math.max(0, snapshot.visibilityType()));
+        waypoint.setPurpose(purpose(snapshot.purpose()));
     }
 
     private static MinimapWorld worldFor(MinimapSession session, ResourceKey<Level> dimension) {
@@ -249,8 +286,53 @@ public final class XaeroWaypointSyncClient {
         }
     }
 
+    private static WaypointClientEditPayload payload(UUID id, Snapshot snapshot, boolean delete) {
+        return new WaypointClientEditPayload(
+            delete,
+            id,
+            snapshot.name(),
+            snapshot.initials(),
+            snapshot.dimension(),
+            snapshot.x(),
+            snapshot.y(),
+            snapshot.z(),
+            snapshot.color(),
+            snapshot.setName(),
+            snapshot.disabled(),
+            snapshot.yIncluded(),
+            snapshot.visibilityType(),
+            snapshot.purpose()
+        );
+    }
+
+    private static boolean isTracked(Waypoint waypoint) {
+        for (TrackedWaypoint tracked : TRACKED.values()) {
+            if (tracked.waypoint() == waypoint) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean shouldSkipImport(Waypoint waypoint) {
+        return waypoint.isTemporary() || waypoint.getPurpose().isDestination() || waypoint.isOneoffDestination();
+    }
+
+    private static UUID importedId(String dimension, String setName, Waypoint waypoint) {
+        String key = dimension + "|" + setName + "|" + waypoint.getCreatedAt() + "|" + waypoint.getX() + "|" + waypoint.getY() + "|" + waypoint.getZ() + "|" + safeWaypointText(waypoint.getName(), 32, "Waypoint");
+        return UUID.nameUUIDFromBytes(key.getBytes(StandardCharsets.UTF_8));
+    }
+
     private static WaypointColor color(int color) {
         return WaypointColor.fromIndex(Math.floorMod(color, WaypointColor.values().length));
+    }
+
+    private static WaypointPurpose purpose(String value) {
+        try {
+            return WaypointPurpose.valueOf(value.trim().toUpperCase(Locale.ROOT));
+        } catch (RuntimeException ignored) {
+            return WaypointPurpose.NORMAL;
+        }
     }
 
     private static boolean sameName(Waypoint waypoint, String name) {
@@ -285,28 +367,38 @@ public final class XaeroWaypointSyncClient {
         }
     }
 
-    private record Snapshot(String dimension, int x, int y, int z, String name, String initials, int color) {
+    private record Snapshot(String dimension, String setName, int x, int y, int z, String name, String initials, int color, boolean disabled, boolean yIncluded, int visibilityType, String purpose) {
         private static Snapshot fromPayload(WaypointSyncPayload payload) {
             return new Snapshot(
                 payload.dimension(),
+                cleanSetName(payload.setName()),
                 payload.x(),
                 payload.y(),
                 payload.z(),
                 safeWaypointText(payload.name(), 32, "Waypoint"),
                 safeWaypointText(payload.initials(), 3, "WP"),
-                Math.floorMod(payload.color(), WaypointColor.values().length)
+                Math.floorMod(payload.color(), WaypointColor.values().length),
+                payload.disabled(),
+                payload.yIncluded(),
+                Math.max(0, payload.visibilityType()),
+                cleanPurpose(payload.purpose())
             );
         }
 
-        private static Snapshot fromWaypoint(String dimension, Waypoint waypoint) {
+        private static Snapshot fromWaypoint(String dimension, String setName, Waypoint waypoint) {
             return new Snapshot(
                 dimension,
+                cleanSetName(setName),
                 waypoint.getX(),
                 waypoint.getY(),
                 waypoint.getZ(),
                 safeWaypointText(waypoint.getName(), 32, "Waypoint"),
                 safeWaypointText(waypoint.getInitials(), 3, "WP"),
-                Math.floorMod(waypoint.getColor(), WaypointColor.values().length)
+                Math.floorMod(waypoint.getColor(), WaypointColor.values().length),
+                waypoint.isDisabled(),
+                waypoint.isYIncluded(),
+                waypoint.getVisibilityType(),
+                cleanPurpose(waypoint.getPurpose().name())
             );
         }
 
@@ -320,7 +412,22 @@ public final class XaeroWaypointSyncClient {
                 && z == waypoint.getZ()
                 && color == Math.floorMod(waypoint.getColor(), WaypointColor.values().length)
                 && name.equals(safeWaypointText(waypoint.getName(), 32, "Waypoint"))
-                && initials.equals(safeWaypointText(waypoint.getInitials(), 3, "WP"));
+                && initials.equals(safeWaypointText(waypoint.getInitials(), 3, "WP"))
+                && disabled == waypoint.isDisabled()
+                && yIncluded == waypoint.isYIncluded()
+                && visibilityType == waypoint.getVisibilityType()
+                && purpose.equals(cleanPurpose(waypoint.getPurpose().name()));
+        }
+    }
+
+    private static String cleanPurpose(String value) {
+        if (value == null || value.isBlank()) {
+            return WaypointPurpose.NORMAL.name();
+        }
+        try {
+            return WaypointPurpose.valueOf(value.trim().toUpperCase(Locale.ROOT)).name();
+        } catch (RuntimeException ignored) {
+            return WaypointPurpose.NORMAL.name();
         }
     }
 }

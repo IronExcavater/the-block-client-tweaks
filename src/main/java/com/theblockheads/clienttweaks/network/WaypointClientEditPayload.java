@@ -16,7 +16,12 @@ public record WaypointClientEditPayload(
     int x,
     int y,
     int z,
-    int color
+    int color,
+    String setName,
+    boolean disabled,
+    boolean yIncluded,
+    int visibilityType,
+    String purpose
 ) implements CustomPacketPayload {
     public static final Type<WaypointClientEditPayload> TYPE =
         new Type<>(Identifier.fromNamespaceAndPath("blockheads_server", "xaero_waypoint_edit"));
@@ -25,7 +30,7 @@ public record WaypointClientEditPayload(
         StreamCodec.ofMember(WaypointClientEditPayload::write, WaypointClientEditPayload::read);
 
     public static WaypointClientEditPayload delete(UUID id) {
-        return new WaypointClientEditPayload(true, id, "", "", "", 0, 0, 0, 0);
+        return new WaypointClientEditPayload(true, id, "", "", "", 0, 0, 0, 0, "Blockheads", false, true, 0, "NORMAL");
     }
 
     private void write(RegistryFriendlyByteBuf buf) {
@@ -38,6 +43,11 @@ public record WaypointClientEditPayload(
         buf.writeVarInt(y);
         buf.writeVarInt(z);
         buf.writeVarInt(color);
+        buf.writeUtf(setName);
+        buf.writeBoolean(disabled);
+        buf.writeBoolean(yIncluded);
+        buf.writeVarInt(visibilityType);
+        buf.writeUtf(purpose);
     }
 
     private static WaypointClientEditPayload read(RegistryFriendlyByteBuf buf) {
@@ -50,7 +60,12 @@ public record WaypointClientEditPayload(
             buf.readVarInt(),
             buf.readVarInt(),
             buf.readVarInt(),
-            buf.readVarInt()
+            buf.readVarInt(),
+            buf.readUtf(),
+            buf.readBoolean(),
+            buf.readBoolean(),
+            buf.readVarInt(),
+            buf.readUtf()
         );
     }
 
